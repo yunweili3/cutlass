@@ -683,10 +683,35 @@ class ArithValue(ir.Value):
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
     ) -> "ArithValue":
+        # Python % takes the divisor's sign (consistent with the flooring
+        # __floordiv__), while arith.remsi / arith.remf take the dividend's.
+        # r = rem(a, b); if r != 0 and sign(r) != sign(b): r += b.
         if self.is_float:
-            return arith.remf(self, other, loc=loc, ip=ip)
+            r = arith.remf(self, other, loc=loc, ip=ip)
+            zero = const(0.0, r.type, loc=loc, ip=ip)
+            r_neg = arith.cmpf(arith.CmpFPredicate.OLT, r, zero, loc=loc, ip=ip)
+            b_neg = arith.cmpf(arith.CmpFPredicate.OLT, other, zero, loc=loc, ip=ip)
+            r_nonzero = arith.cmpf(arith.CmpFPredicate.ONE, r, zero, loc=loc, ip=ip)
+            fix = arith.andi(
+                arith.xori(r_neg, b_neg, loc=loc, ip=ip), r_nonzero, loc=loc, ip=ip
+            )
+            r = arith.select(
+                fix, arith.addf(r, other, loc=loc, ip=ip), r, loc=loc, ip=ip
+            )
+            # A zero result also takes the divisor's sign (-4.0 % 2.0 == 0.0).
+            return math.copysign(r, other, loc=loc, ip=ip)
         elif self.signed != False:  # noqa: E712
-            return arith.remsi(self, other, loc=loc, ip=ip)
+            r = arith.remsi(self, other, loc=loc, ip=ip)
+            zero = const(0, r.type, loc=loc, ip=ip)
+            r_neg = arith.cmpi(arith.CmpIPredicate.slt, r, zero, loc=loc, ip=ip)
+            b_neg = arith.cmpi(arith.CmpIPredicate.slt, other, zero, loc=loc, ip=ip)
+            r_nonzero = arith.cmpi(arith.CmpIPredicate.ne, r, zero, loc=loc, ip=ip)
+            fix = arith.andi(
+                arith.xori(r_neg, b_neg, loc=loc, ip=ip), r_nonzero, loc=loc, ip=ip
+            )
+            return arith.select(
+                fix, arith.addi(r, other, loc=loc, ip=ip), r, loc=loc, ip=ip
+            )
         else:
             return arith.remui(self, other, loc=loc, ip=ip)
 
