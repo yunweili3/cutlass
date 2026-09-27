@@ -15,11 +15,14 @@ Unit tests for `//` and `%` on dynamic signed integers and floats.
 `//` floors, so `%` must take the divisor's sign for `(a // b) * b + a % b == a`
 to hold, as it does in Python and for constant-folded operands. arith.remsi and
 arith.remf take the dividend's sign, so `ArithValue.__mod__` corrects them.
-Results are computed on the GPU, per scalar and per TensorSSA, and compared
-against Python for every sign combination.
+Float `//` derives the quotient from the remainder, as Python does, rather than
+flooring a rounded `a / b`, which disagrees for e.g. `-1.0 // inf` and
+`1.0 // 0.1`. Results are computed on the GPU, per scalar and per TensorSSA,
+and compared against Python for every sign combination.
 """
 
 import math
+import struct
 import unittest
 
 import cutlass.cute as cute
@@ -33,13 +36,15 @@ try:
 except ImportError:
     HAS_CUDA = False
 
-N = 16
+N = 24
 
 INT_PAIRS = [
     (7, 2), (-7, 2), (7, -2), (-7, -2),
     (6, 3), (-6, 3), (6, -3), (-6, -3),
     (0, 4), (0, -4), (-1, 4), (1, -4),
     (3, 5), (-3, 5), (3, -5), (-3, -5),
+    (-8, 3), (8, -3), (-1, -4), (1, 4),
+    (2**30, -3), (-(2**30), 3), (-5, 1), (5, -1),
 ]  # fmt: skip
 
 FLOAT_PAIRS = [
@@ -47,7 +52,13 @@ FLOAT_PAIRS = [
     (6.0, 3.0), (-6.0, 3.0), (6.0, -3.0), (-6.0, -3.0),
     (0.0, 4.0), (-0.0, 4.0), (0.0, -4.0), (-1.5, 4.0),
     (5.5, -2.0), (-5.5, -2.0), (-0.5, 3.0), (0.5, -3.0),
+    (1.0, math.inf), (-1.0, math.inf), (1.0, -math.inf), (-1.0, -math.inf),
+    (1.0, 0.1), (-1.0, 0.1), (0.7, 0.1), (-0.0, -4.0),
 ]  # fmt: skip
+
+
+def _f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
 
 
 @cute.kernel
@@ -84,17 +95,20 @@ class TestFloordivModSign(unittest.TestCase):
         r = torch.zeros_like(a)
         fn(from_dlpack(a), from_dlpack(b), from_dlpack(q), from_dlpack(r))
         torch.cuda.synchronize()
-        return q.tolist(), r.tolist()
+        # Reference against the stored values, e.g. 0.1 rounded to float32.
+        return list(zip(a.tolist(), b.tolist())), q.tolist(), r.tolist()
 
     def _check(self, pairs, q, r, is_float):
         for (x, y), qi, ri in zip(pairs, q, r):
             with self.subTest(a=x, b=y):
-                self.assertEqual(qi, x // y)
-                self.assertEqual(ri, x % y)
                 if is_float:
-                    # Zero results take the divisor's sign as well.
-                    self.assertEqual(math.copysign(1.0, ri), math.copysign(1.0, x % y))
+                    for got, want in [(qi, _f32(x // y)), (ri, _f32(x % y))]:
+                        self.assertEqual(got, want)
+                        # Zero results must carry Python's sign as well.
+                        self.assertEqual(math.copysign(1, got), math.copysign(1, want))
                 else:
+                    self.assertEqual(qi, x // y)
+                    self.assertEqual(ri, x % y)
                     self.assertEqual(qi * y + ri, x)
 
     def test_scalar(self):
@@ -104,13 +118,13 @@ class TestFloordivModSign(unittest.TestCase):
             (torch.float32, FLOAT_PAIRS),
         ]:
             with self.subTest(dtype=dtype):
-                q, r = self._run(_scalar, pairs, dtype)
+                pairs, q, r = self._run(_scalar, pairs, dtype)
                 self._check(pairs, q, r, dtype.is_floating_point)
 
     def test_tensor_ssa(self):
         for dtype, pairs in [(torch.int32, INT_PAIRS), (torch.float32, FLOAT_PAIRS)]:
             with self.subTest(dtype=dtype):
-                q, r = self._run(_vector, pairs, dtype)
+                pairs, q, r = self._run(_vector, pairs, dtype)
                 self._check(pairs, q, r, dtype.is_floating_point)
 
     def test_dynamic_matches_constant(self):
